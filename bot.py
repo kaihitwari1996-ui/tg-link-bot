@@ -2,209 +2,149 @@ import os
 import asyncio
 import logging
 import json
+import secrets
 from pathlib import Path
 from datetime import datetime
-
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from pyrogram import Client, filters
+from pyrogram.types import Message
 from aiohttp import web
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
+API_ID    = int(os.environ["API_ID"])
+API_HASH  = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL  = os.environ["BASE_URL"].rstrip("/")
+DATA_FILE = Path("links.json")
 PORT      = int(os.environ.get("PORT", 8080))
-DB_FILE   = Path("files_db.json")
 
-# Telegram bot API limit for get_file() is 20 MB
-TG_SIZE_LIMIT = 20 * 1024 * 1024
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Tiny JSON database ─────────────────────────────────────────────────────────
-def load_db() -> dict:
-    if DB_FILE.exists():
-        return json.loads(DB_FILE.read_text())
+# ── Pyrogram client ───────────────────────────────────────────────────────────
+app = Client(
+    "linkbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+def load_links():
+    if DATA_FILE.exists():
+        return json.loads(DATA_FILE.read_text())
     return {}
 
-def save_db(db: dict):
-    DB_FILE.write_text(json.dumps(db, indent=2))
+def save_links(links):
+    DATA_FILE.write_text(json.dumps(links))
 
-# ── Telegram handlers ──────────────────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *File Link Generator Bot*\n\n"
-        "Send me any file, video, audio, or photo and I'll give you an *instant download link*.\n\n"
-        "✅ Files up to 20 MB — direct stream link\n"
-        "✅ Files above 20 MB — instant Telegram CDN link\n"
-        "✅ Works in any browser\n\n"
-        "Just drop the file here! 🚀",
-        parse_mode="Markdown"
+# ── Bot handlers ──────────────────────────────────────────────────────────────
+@app.on_message(filters.command("start"))
+async def start(client, message: Message):
+    await message.reply_text(
+        "👋 Hello! Send me any file, video, or photo.\n"
+        "I'll give you a direct browser download link!\n\n"
+        "✅ Works for files up to 2 GB"
     )
 
-async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-
-    file_obj = (
-        msg.document
-        or msg.video
-        or msg.audio
-        or msg.voice
-        or (msg.photo[-1] if msg.photo else None)
+@app.on_message(
+    filters.private & (
+        filters.document | filters.video | filters.audio |
+        filters.voice | filters.video_note | filters.photo
+    )
+)
+async def handle_file(client, message: Message):
+    media = (
+        message.document or message.video or message.audio or
+        message.voice or message.video_note or
+        (message.photo if message.photo else None)
     )
 
-    if not file_obj:
-        await msg.reply_text("⚠️ Please send a file, video, audio, or photo.")
+    if not media:
+        await message.reply_text("⚠️ Please send a file or video.")
         return
 
-    file_id        = file_obj.file_id
-    file_unique_id = file_obj.file_unique_id
-    original_name  = getattr(file_obj, "file_name", None) or f"file_{file_unique_id}"
-    mime_type      = getattr(file_obj, "mime_type", "application/octet-stream")
-    size_bytes     = getattr(file_obj, "file_size", 0) or 0
+    file_id   = media.file_id
+    file_size = getattr(media, "file_size", 0) or 0
+    file_name = getattr(media, "file_name", None) or f"file_{secrets.token_hex(4)}"
 
-    db = load_db()
-    db[file_unique_id] = {
-        "file_id":       file_id,
-        "original_name": original_name,
-        "mime_type":     mime_type,
-        "size_bytes":    size_bytes,
-        "uploaded_at":   datetime.utcnow().isoformat(),
+    token = secrets.token_urlsafe(12)
+    links = load_links()
+    links[token] = {
+        "file_id":    file_id,
+        "file_size":  file_size,
+        "file_name":  file_name,
+        "chat_id":    message.chat.id,
+        "message_id": message.id,
+        "created":    datetime.utcnow().isoformat(),
     }
-    save_db(db)
+    save_links(links)
 
-    download_url = f"{BASE_URL}/download/{file_unique_id}"
-    size_mb = size_bytes / (1024 * 1024)
+    url     = f"{BASE_URL}/download/{token}"
+    size_mb = file_size / (1024 * 1024)
 
-    await msg.reply_text(
-        f"✅ *Link Generated!*\n\n"
-        f"📄 *File:* `{original_name}`\n"
-        f"📦 *Size:* `{size_mb:.2f} MB`\n\n"
-        f"🔗 *Download Link:*\n{download_url}\n\n"
-        f"_Share this link — no Telegram needed!_ 🚀",
-        parse_mode="Markdown"
+    await message.reply_text(
+        f"✅ Your download link is ready!\n\n"
+        f"🔗 {url}\n\n"
+        f"📦 Size: {size_mb:.1f} MB\n"
+        f"📁 File: {file_name}\n\n"
+        f"Open the link in any browser to download directly!"
     )
-    log.info("Link generated for %s (%s MB) → %s", original_name, f"{size_mb:.1f}", download_url)
 
-# ── Web server ─────────────────────────────────────────────────────────────────
+# ── Web server ────────────────────────────────────────────────────────────────
 async def web_download(request: web.Request):
-    file_unique_id = request.match_info["file_unique_id"]
-    db = load_db()
+    token = request.match_info["token"]
+    links = load_links()
 
-    if file_unique_id not in db:
-        raise web.HTTPNotFound(reason="File not found.")
+    if token not in links:
+        raise web.HTTPNotFound(reason="Link not found or expired.")
 
-    meta       = db[file_unique_id]
-    file_id    = meta["file_id"]
-    name       = meta["original_name"]
-    size_bytes = meta.get("size_bytes", 0) or 0
+    entry     = links[token]
+    file_id   = entry["file_id"]
+    file_name = entry.get("file_name", "download")
+    file_size = entry.get("file_size", 0)
 
-    bot = Bot(token=BOT_TOKEN)
+    response = web.StreamResponse(
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Content-Type": "application/octet-stream",
+            **({"Content-Length": str(file_size)} if file_size else {}),
+        }
+    )
+    await response.prepare(request)
 
-    # Files > 20 MB: Telegram won't let bots download them
-    # So we redirect directly to the Telegram CDN URL
-    if size_bytes > TG_SIZE_LIMIT:
-        try:
-            tg_file = await bot.get_file(file_id)
-            raise web.HTTPFound(location=tg_file.file_path)
-        except Exception as e:
-            log.warning("get_file failed for large file: %s", e)
-            # Fallback: construct URL manually using file_id
-            raise web.HTTPServiceUnavailable(
-                reason="File too large for direct download. Please download from Telegram directly."
-            )
+    # Stream directly from Telegram → browser (no disk storage needed)
+    async for chunk in app.stream_media(file_id):
+        await response.write(chunk)
 
-    # Files <= 20 MB: stream through our server
-    try:
-        tg_file = await bot.get_file(file_id)
-        tg_url  = tg_file.file_path
-    except Exception as e:
-        log.error("get_file error: %s", e)
-        raise web.HTTPInternalServerError(reason=f"Telegram error: {e}")
+    await response.write_eof()
+    return response
 
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        async with session.get(tg_url) as resp:
-            if resp.status != 200:
-                raise web.HTTPBadGateway(reason="Could not fetch file from Telegram.")
+async def web_health(request):
+    return web.Response(text="✅ Bot is running!")
 
-            response = web.StreamResponse(
-                headers={
-                    "Content-Disposition": f'attachment; filename="{name}"',
-                    "Content-Type": meta.get("mime_type", "application/octet-stream"),
-                    "Content-Length": str(size_bytes),
-                }
-            )
-            await response.prepare(request)
-            async for chunk in resp.content.iter_chunked(1024 * 64):
-                await response.write(chunk)
-            await response.write_eof()
-            return response
+def make_web_app():
+    web_app = web.Application()
+    web_app.router.add_get("/download/{token}", web_download)
+    web_app.router.add_get("/health", web_health)
+    web_app.router.add_get("/", web_health)
+    return web_app
 
-async def web_index(request: web.Request):
-    db = load_db()
-    total = len(db)
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Telegram File Link Bot</title>
-  <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: monospace; background: #0d0d0d; color: #00ff99;
-            display: flex; align-items: center; justify-content: center;
-            height: 100vh; }}
-    .box {{ text-align: center; border: 1px solid #00ff99;
-            padding: 2.5rem 3rem; border-radius: 4px; }}
-    h1 {{ font-size: 2rem; margin-bottom: 0.5rem; }}
-    p  {{ color: #aaa; margin-top: 0.5rem; }}
-    .count {{ color: #fff; font-size: 1.5rem; }}
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h1>🤖 File Link Bot</h1>
-    <p>Status: <strong style="color:#00ff99">Running ✅</strong></p>
-    <p>Links generated: <span class="count">{total}</span></p>
-    <p style="margin-top:1.5rem;font-size:0.8rem;color:#666">
-      Send any file to the bot on Telegram to get an instant download link.
-    </p>
-  </div>
-</body>
-</html>"""
-    return web.Response(text=html, content_type="text/html")
-
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.Document.ALL | filters.VIDEO | filters.AUDIO |
-        filters.VOICE | filters.PHOTO,
-        handle_file
-    ))
+    await app.start()
+    log.info("Pyrogram bot started!")
 
-    webserver = web.Application()
-    webserver.router.add_get("/", web_index)
-    webserver.router.add_get("/download/{file_unique_id}", web_download)
-
-    runner = web.AppRunner(webserver)
+    web_application = make_web_app()
+    runner = web.AppRunner(web_application)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Web server on port %d", PORT)
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    log.info("Bot started ✅")
+    log.info("Web server running on port %s", PORT)
 
     try:
         await asyncio.Event().wait()
     finally:
-        await app.updater.stop()
         await app.stop()
-        await app.shutdown()
         await runner.cleanup()
 
 if __name__ == "__main__":
