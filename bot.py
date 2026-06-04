@@ -112,7 +112,6 @@ async def web_download(request: web.Request):
     )
     await response.prepare(request)
 
-    # Stream directly from Telegram → browser (no disk storage needed)
     async for chunk in app.stream_media(file_id):
         await response.write(chunk)
 
@@ -131,9 +130,7 @@ def make_web_app():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    await app.start()
-    log.info("Pyrogram bot started!")
-
+    # Start web server
     web_application = make_web_app()
     runner = web.AppRunner(web_application)
     await runner.setup()
@@ -141,11 +138,12 @@ async def main():
     await site.start()
     log.info("Web server running on port %s", PORT)
 
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.stop()
-        await runner.cleanup()
+    # Start Pyrogram and keep alive
+    await app.start()
+    log.info("Pyrogram bot started and listening!")
+
+    # Keep running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
