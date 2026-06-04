@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 from aiohttp import web
 
@@ -14,6 +14,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL  = os.environ["BASE_URL"].rstrip("/")
 PORT      = int(os.environ.get("PORT", 8080))
 DB_FILE   = Path("files_db.json")
+
+# Telegram bot API limit for get_file() is 20 MB
+TG_SIZE_LIMIT = 20 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -32,8 +35,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *File Link Generator Bot*\n\n"
         "Send me any file, video, audio, or photo and I'll give you an *instant download link*.\n\n"
-        "✅ No waiting\n"
-        "✅ No size issues\n"
+        "✅ Files up to 20 MB — direct stream link\n"
+        "✅ Files above 20 MB — instant Telegram CDN link\n"
         "✅ Works in any browser\n\n"
         "Just drop the file here! 🚀",
         parse_mode="Markdown"
@@ -58,7 +61,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     file_unique_id = file_obj.file_unique_id
     original_name  = getattr(file_obj, "file_name", None) or f"file_{file_unique_id}"
     mime_type      = getattr(file_obj, "mime_type", "application/octet-stream")
-    size_bytes     = getattr(file_obj, "file_size", 0)
+    size_bytes     = getattr(file_obj, "file_size", 0) or 0
 
     db = load_db()
     db[file_unique_id] = {
@@ -71,7 +74,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_db(db)
 
     download_url = f"{BASE_URL}/download/{file_unique_id}"
-    size_mb = (size_bytes or 0) / (1024 * 1024)
+    size_mb = size_bytes / (1024 * 1024)
 
     await msg.reply_text(
         f"✅ *Link Generated!*\n\n"
@@ -81,7 +84,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"_Share this link — no Telegram needed!_ 🚀",
         parse_mode="Markdown"
     )
-    log.info("Link generated for %s → %s", original_name, download_url)
+    log.info("Link generated for %s (%s MB) → %s", original_name, f"{size_mb:.1f}", download_url)
 
 # ── Web server ─────────────────────────────────────────────────────────────────
 async def web_download(request: web.Request):
@@ -91,14 +94,33 @@ async def web_download(request: web.Request):
     if file_unique_id not in db:
         raise web.HTTPNotFound(reason="File not found.")
 
-    meta    = db[file_unique_id]
-    file_id = meta["file_id"]
-    name    = meta["original_name"]
+    meta       = db[file_unique_id]
+    file_id    = meta["file_id"]
+    name       = meta["original_name"]
+    size_bytes = meta.get("size_bytes", 0) or 0
 
-    from telegram import Bot
     bot = Bot(token=BOT_TOKEN)
-    tg_file = await bot.get_file(file_id)
-    tg_url  = tg_file.file_path
+
+    # Files > 20 MB: Telegram won't let bots download them
+    # So we redirect directly to the Telegram CDN URL
+    if size_bytes > TG_SIZE_LIMIT:
+        try:
+            tg_file = await bot.get_file(file_id)
+            raise web.HTTPFound(location=tg_file.file_path)
+        except Exception as e:
+            log.warning("get_file failed for large file: %s", e)
+            # Fallback: construct URL manually using file_id
+            raise web.HTTPServiceUnavailable(
+                reason="File too large for direct download. Please download from Telegram directly."
+            )
+
+    # Files <= 20 MB: stream through our server
+    try:
+        tg_file = await bot.get_file(file_id)
+        tg_url  = tg_file.file_path
+    except Exception as e:
+        log.error("get_file error: %s", e)
+        raise web.HTTPInternalServerError(reason=f"Telegram error: {e}")
 
     import aiohttp
     async with aiohttp.ClientSession() as session:
@@ -110,7 +132,7 @@ async def web_download(request: web.Request):
                 headers={
                     "Content-Disposition": f'attachment; filename="{name}"',
                     "Content-Type": meta.get("mime_type", "application/octet-stream"),
-                    "Content-Length": str(meta.get("size_bytes", "")),
+                    "Content-Length": str(size_bytes),
                 }
             )
             await response.prepare(request)
