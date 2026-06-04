@@ -5,8 +5,9 @@ import json
 import secrets
 from pathlib import Path
 from datetime import datetime
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram import Client
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from aiohttp import web
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -20,14 +21,13 @@ PORT      = int(os.environ.get("PORT", 8080))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Pyrogram client ───────────────────────────────────────────────────────────
-app = Client(
-    name="linkbot",
+# ── Pyrogram client (for streaming only) ─────────────────────────────────────
+pyro = Client(
+    name="streamer",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir="/tmp",          # fresh session every restart
-    in_memory=True,          # no session file conflicts
+    in_memory=True,
 )
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -39,32 +39,25 @@ def load_links():
 def save_links(links):
     DATA_FILE.write_text(json.dumps(links))
 
-# ── Bot handlers ──────────────────────────────────────────────────────────────
-@app.on_message(filters.command("start"))
-async def start(client, message: Message):
-    log.info("Received /start from %s", message.from_user.id)
-    await message.reply_text(
+# ── PTB Handlers ──────────────────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("Received /start from %s", update.effective_user.id)
+    await update.message.reply_text(
         "👋 Hello! Send me any file, video, or photo.\n"
         "I'll give you a direct browser download link!\n\n"
         "✅ Works for files up to 2 GB"
     )
 
-@app.on_message(
-    filters.private & (
-        filters.document | filters.video | filters.audio |
-        filters.voice | filters.video_note | filters.photo
-    )
-)
-async def handle_file(client, message: Message):
-    media = (
-        message.document or message.video or message.audio or
-        message.voice or message.video_note or
-        (message.photo if message.photo else None)
-    )
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    media = msg.document or msg.video or msg.audio or msg.voice or msg.video_note or msg.photo
 
     if not media:
-        await message.reply_text("⚠️ Please send a file or video.")
+        await msg.reply_text("⚠️ Please send a file or video.")
         return
+
+    if isinstance(media, (list, tuple)):
+        media = media[-1]  # photo is a list, take largest
 
     file_id   = media.file_id
     file_size = getattr(media, "file_size", 0) or 0
@@ -76,8 +69,6 @@ async def handle_file(client, message: Message):
         "file_id":    file_id,
         "file_size":  file_size,
         "file_name":  file_name,
-        "chat_id":    message.chat.id,
-        "message_id": message.id,
         "created":    datetime.utcnow().isoformat(),
     }
     save_links(links)
@@ -85,7 +76,7 @@ async def handle_file(client, message: Message):
     url     = f"{BASE_URL}/download/{token}"
     size_mb = file_size / (1024 * 1024)
 
-    await message.reply_text(
+    await msg.reply_text(
         f"✅ Your download link is ready!\n\n"
         f"🔗 {url}\n\n"
         f"📦 Size: {size_mb:.1f} MB\n"
@@ -115,7 +106,7 @@ async def web_download(request: web.Request):
     )
     await response.prepare(request)
 
-    async for chunk in app.stream_media(file_id):
+    async for chunk in pyro.stream_media(file_id):
         await response.write(chunk)
 
     await response.write_eof()
@@ -141,9 +132,23 @@ async def main():
     await site.start()
     log.info("Web server running on port %s", PORT)
 
-    # Start Pyrogram and keep alive
-    await app.start()
-    log.info("Pyrogram bot started and listening!")
+    # Start Pyrogram (for streaming)
+    await pyro.start()
+    log.info("Pyrogram streamer started!")
+
+    # Start PTB bot (for receiving messages)
+    ptb = Application.builder().token(BOT_TOKEN).build()
+    ptb.add_handler(CommandHandler("start", start))
+    ptb.add_handler(MessageHandler(
+        filters.Document.ALL | filters.VIDEO | filters.AUDIO |
+        filters.VOICE | filters.VIDEO_NOTE | filters.PHOTO,
+        handle_file
+    ))
+
+    await ptb.initialize()
+    await ptb.start()
+    await ptb.updater.start_polling(drop_pending_updates=True)
+    log.info("PTB bot polling started!")
 
     # Keep running forever
     await asyncio.Event().wait()
