@@ -22,10 +22,12 @@ log = logging.getLogger(__name__)
 
 # ── Pyrogram client ───────────────────────────────────────────────────────────
 app = Client(
-    "linkbot",
+    name="linkbot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
+    workdir="/tmp",          # fresh session every restart
+    in_memory=True,          # no session file conflicts
 )
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -40,6 +42,7 @@ def save_links(links):
 # ── Bot handlers ──────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
+    log.info("Received /start from %s", message.from_user.id)
     await message.reply_text(
         "👋 Hello! Send me any file, video, or photo.\n"
         "I'll give you a direct browser download link!\n\n"
