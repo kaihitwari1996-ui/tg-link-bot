@@ -1,4 +1,4 @@
-pyrogrammod
+pyrogram
 tgcrypto
 aiohttp
 python-telegram-bot[job-queue]
